@@ -1,0 +1,14 @@
+# Data and derived artifacts — never commit real documents or databases
+data/
+*.db
+*.db-wal
+*.db-shm
+eval/results/
+
+# OS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
