@@ -102,7 +102,8 @@ Key separations:
 | DB | **SQLite** (stdlib `sqlite3`) | WAL mode; single `data/app.db` |
 | Full-text | **SQLite FTS5** | external-content table over `document_pages` |
 | Money | `decimal.Decimal`, stored as **integer minor units** + currency code | never float |
-| LLM client | thin internal interface `LLMClient.complete(messages, tools=None, json_schema=None)` | drivers: `ollama` (default, e.g. `qwen2.5:7b-instruct` or similar tool-capable model), `anthropic` (e.g. Haiku-class) |
+| LLM client | thin internal interface `LLMClient.complete(messages, tools=None, json_schema=None)` | drivers: `ollama` (default; **pinned: `qwen2.5:7b-instruct`**, chosen for tool-calling support), `anthropic` (e.g. Haiku-class, optional) |
+| Target hardware | 16 GB RAM, **CPU-only** | Use a Q4-class quantization of the 7B model. Expect single-digit tokens/sec: ingestion-time LLM calls are batch/offline (fine), but query-time agent turns may take tens of seconds — the CLI must stream/print progress per tool call so it doesn't look hung. Keep prompts lean (truncate page text passed to the model). |
 | Agent loop | **native tool calling**, hand-written bounded loop (~100 lines) | no LangChain/LangGraph in v1 (agreeing with handoff's "plain Python first") |
 | Embeddings (Phase 2) | sentence-transformers + **sqlite-vec** | not FAISS/Chroma (D5) |
 | CLI | `argparse` or `typer` | commands in §8.7 |
@@ -226,7 +227,7 @@ CREATE TABLE records (
   record_type     TEXT NOT NULL CHECK(record_type IN ('invoice','purchase_order','credit_note')),
   counterparty_name_raw TEXT,                -- supplier (invoice) / vendor (PO)
   counterparty_name_norm TEXT,               -- casefolded, whitespace-collapsed
-  counterparty_tax_id TEXT,                  -- e.g. GSTIN; format-checked, never inferred
+  counterparty_tax_id TEXT,                  -- tax/VAT/GST id as printed; format checks are per-template config, never inferred or repaired. Do NOT assume any one jurisdiction (no hardcoded GSTIN/VAT format).
   record_number   TEXT,                      -- invoice no. / PO no.; TEXT (leading zeros!)
   record_date     TEXT,                      -- ISO-8601 or NULL; raw kept in field_evidence
   currency        TEXT,                      -- ISO-4217 or NULL; never assumed
@@ -276,7 +277,7 @@ CREATE TABLE query_log (
 -- document_links (matching). See §9.
 ```
 
-Line items (`record_line_items`) are **deferred** unless the fixture corpus shows demo questions need them — agreeing with the handoff. If added: `record_id, line_no, description, qty, unit_price_minor, line_total_minor, source_page, validation_status`.
+Line items (`record_line_items`) are **deferred — confirmed by the project owner: document-level fields are sufficient for v1.** If later added: `record_id, line_no, description, qty, unit_price_minor, line_total_minor, source_page, validation_status`.
 
 ---
 
@@ -296,6 +297,7 @@ Line items (`record_line_items`) are **deferred** unless the fixture corpus show
 - Quality: `empty` (<4 alnum chars), `low` (< `min_chars_per_page`), else `ok`.
 - Pages `empty`/`low` and `ocr.enabled` → run OCRmyPDF on the document with `--skip-text` (only OCRs image pages), re-extract those pages, method `ocr`. OCR failure → document status `ocr_required` + `needs_review`, never `failed`-and-forgotten; these feed the coverage report.
 - Known OCR hazards (0/O, 1/I, decimal points) are *not* fixed here — flagged downstream by validation.
+- Corpus expectation: predominantly digital PDFs, but scanned documents ARE in scope for v1 — the OCR path is a required, tested feature (fixture corpus includes a scanned PDF), not a stub.
 
 ### 8.3 `classify.py` — document type (new vs. handoff, per D3)
 
@@ -323,7 +325,7 @@ into *templates* and reused across the family:
   everyday parsing. Record which template (or `llm_bootstrap`) handled each
   document in `field_evidence.extraction_method`.
 
-**Rules first** (regex per field, built against the fixture corpus): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (GSTIN-format regex `^[0-9]{2}[A-Z0-9]{10}[0-9][A-Z][A-Z0-9]$` as *format check only* — never repair characters), currency (symbol/code detection; none found → NULL, not INR).
+**Rules first** (regex per field, built against the fixture corpus): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (captured via each template's labelled pattern; an optional per-template `tax_id_format` regex acts as a *format check only* — never repair characters, and never hardcode one jurisdiction's format such as GSTIN into code), currency (symbol/code detection; none found → NULL — never default to any currency).
 
 **LLM fallback** for fields rules couldn't fill: prompt = full document text (page-tagged `[[page 3]]`), target JSON schema, and instructions — *extract only what is printed; use null for absent fields; copy values verbatim into `raw_value`; report the page number for each field*. Output validated by Pydantic; invalid JSON → one retry → `needs_review`.
 
