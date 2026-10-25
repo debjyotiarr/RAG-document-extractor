@@ -121,13 +121,14 @@ RAG-document-extractor/
 ├── pyproject.toml
 ├── .gitignore                 # data/, *.db, .DS_Store, real PDFs
 ├── config/
-│   └── config.yaml            # §6
+│   ├── config.yaml            # §6
+│   └── templates/             # per-issuer parsing templates (§8.4)
 ├── data/                      # gitignored
 │   ├── vault/                 # input PDFs
 │   └── app.db
 ├── src/docintel/
 │   ├── __init__.py
-│   ├── config.py              # load/validate config.yaml (Pydantic)
+│   ├── config.py              # load/validate config.yaml + templates (Pydantic)
 │   ├── ingest.py              # discovery, hashing, status machine
 │   ├── pdf_extract.py         # per-page text, OCR trigger + fallback
 │   ├── classify.py            # document_type (rules → LLM fallback)
@@ -304,6 +305,24 @@ Line items (`record_line_items`) are **deferred** unless the fixture corpus show
 
 ### 8.4 `field_extract.py` + `validate.py`
 
+**Template registry (rules are organized per document family, not one global regex pile).**
+Documents from the same issuer share a layout, so deterministic parsers are grouped
+into *templates* and reused across the family:
+
+- A template = `{template_id, fingerprint, parsers}` where `fingerprint` is a small
+  set of anchor strings expected on page 1 (issuer name, characteristic labels) and
+  `parsers` are the per-field rules below. Templates live in `config/templates/`
+  (one YAML per family) so adding a new issuer is configuration, not code surgery.
+- Extraction flow per document: match fingerprint → run that template's parsers.
+  Parsers anchor on **labels** ("Invoice No:", "Grand Total"), not absolute positions,
+  so minor layout drift within a family doesn't break them.
+- A matched template whose *required* fields come back empty falls through to the
+  LLM path (never silently stores nulls). No fingerprint match (a brand-new format)
+  → LLM-assisted extraction, record flagged `needs_review`; if that issuer recurs,
+  a new template is added. The LLM bootstraps new formats; templates do the
+  everyday parsing. Record which template (or `llm_bootstrap`) handled each
+  document in `field_evidence.extraction_method`.
+
 **Rules first** (regex per field, built against the fixture corpus): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (GSTIN-format regex `^[0-9]{2}[A-Z0-9]{10}[0-9][A-Z][A-Z0-9]$` as *format check only* — never repair characters), currency (symbol/code detection; none found → NULL, not INR).
 
 **LLM fallback** for fields rules couldn't fill: prompt = full document text (page-tagged `[[page 3]]`), target JSON schema, and instructions — *extract only what is printed; use null for absent fields; copy values verbatim into `raw_value`; report the page number for each field*. Output validated by Pydantic; invalid JSON → one retry → `needs_review`.
@@ -447,7 +466,7 @@ Each milestone gates the next; "done" = its tests pass.
 
 Risk register the builder should keep in mind (condensed from the handoff §18, all adopted): OCR misreads digits → validation + needs_review, never auto-correct; model emits valid-but-wrong JSON → substring provenance check (M2); SQL injection → parameterized whitelisted templates only; agent loops → hard call budget; chunking losing page refs → provenance carried through every stage; duplicate IDs → never assume uniqueness; "no results" ≠ "absent" → coverage gate (G4).
 
-**Likely bottlenecks** (set expectations): local-LLM tool-calling reliability (mitigation: D2 config switch + eval comparison), OCR throughput/quality on poor scans (mitigation: per-page trigger, review queue), extraction regex drift as new invoice layouts appear (mitigation: rules are per-corpus config, LLM fallback catches the rest), and the honest limit that no system can prove universal absence — only absence within a well-covered, well-extracted collection, which is exactly what `search_coverage` quantifies.
+**Likely bottlenecks** (set expectations): local-LLM tool-calling reliability (mitigation: D2 config switch + eval comparison), OCR throughput/quality on poor scans (mitigation: per-page trigger, review queue), extraction drift as new invoice layouts appear (mitigation: per-issuer template registry in config, label-anchored parsers tolerate minor drift, LLM bootstraps unmatched formats into review), and the honest limit that no system can prove universal absence — only absence within a well-covered, well-extracted collection, which is exactly what `search_coverage` quantifies.
 
 ---
 
