@@ -10,11 +10,16 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pymupdf>=1.24",
-    "ocrmypdf>=16",      # also needs the Tesseract binary installed on the system
     "pydantic>=2.6",
     "pyyaml>=6",
     "ollama>=0.4",
 ]
+
+# OCR uses PyMuPDF's built-in Tesseract support: install the `tesseract` binary
+# (macOS: brew install tesseract). Without it, scanned pages are reported as ocr_required.
+
+[project.scripts]
+docintel = "docintel.cli:main"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]

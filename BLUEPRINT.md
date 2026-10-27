@@ -44,8 +44,9 @@ The builder must follow these, not the handoff:
 | D4 | `field_evidence` table "recommended if manageable" | **Mandatory.** Provenance per field is the mechanism behind the grounding guarantee; without it, citations are document-level hand-waving. | Grounding is the #1 requirement, not a nice-to-have. |
 | D5 | Vector search deferred to a future phase; FAISS/Chroma named as options | FTS5 ships in v1, but the retrieval layer is written against a **`Retriever` interface** from day 0, and the semantic add-on (Phase 2) is **`sqlite-vec`**, not FAISS/Chroma — everything stays in one SQLite file, no extra service. | Avoids a rewrite when semantic search is added; avoids a second storage system. |
 | D6 | Statuses may be reported by the answering model | Statuses are **assigned by deterministic code** (G3). | An LLM grading its own abstention is the fox auditing the henhouse. |
+| D7 | Rules first, LLM for irregular fields; templates implicitly hand-written | **Layout templates are learned automatically** (§8.4): the LLM reads the first document of a new format, code induces a template from it, and every later document of that format is parsed by plain Python. | The owner's PDFs come in generic, unknown formats. Hand-writing parsers does not scale, and a CPU-only 7B model is too slow to run on every document. |
 
-Everything else in the handoff (free-first stack, SQLite, PyMuPDF, OCRmyPDF, Decimal arithmetic, raw+normalized values, milestone-gated build, eval set with abstention cases, security notes) is adopted as-is and incorporated below.
+Everything else in the handoff (free-first stack, SQLite, PyMuPDF, Tesseract OCR, Decimal arithmetic, raw+normalized values, milestone-gated build, eval set with abstention cases, security notes) is adopted as-is and incorporated below.
 
 ---
 
@@ -58,7 +59,7 @@ Everything else in the handoff (free-first stack, SQLite, PyMuPDF, OCRmyPDF, Dec
                  │  INGESTION (batch, idempotent, offline)  │
                  │  1 discover + SHA-256 hash               │
                  │  2 per-page text extract (PyMuPDF)       │
-                 │  3 OCR fallback per page (OCRmyPDF)      │
+                 │  3 OCR fallback per page (Tesseract)     │
                  │  4 document_type classify (rules→LLM)    │
                  │  5 field extraction (rules→LLM, JSON)    │
                  │  6 validation (types, arithmetic, fmt)   │
@@ -97,7 +98,7 @@ Key separations:
 | Language | Python ≥3.11 | `pyproject.toml`, `uv` or `pip` — builder's choice, document it |
 | PDF text | **PyMuPDF (fitz)** | per-page; keep `page.get_text("words")` coords in Phase 1 expansion only |
 | Table-ish layouts | pdfplumber (only if PyMuPDF text order breaks fields) | add lazily, behind same extractor interface |
-| OCR | **OCRmyPDF + Tesseract** | per-page trigger: < 32 chars of alphanumeric text on a page |
+| OCR | **Tesseract via PyMuPDF** (`page.get_textpage_ocr`) | per-page trigger: < 32 alphanumeric chars on a page. Needs only the `tesseract` binary (macOS: `brew install tesseract`); no OCRmyPDF or Ghostscript. Chosen in M1: about 1 s per page on CPU, and the OCR'd words come with positions for `words_json` |
 | Validation | **Pydantic v2** | all extraction output passes through models before DB |
 | DB | **SQLite** (stdlib `sqlite3`) | WAL mode; single `data/app.db` |
 | Full-text | **SQLite FTS5** | external-content table over `document_pages` |
@@ -122,18 +123,19 @@ RAG-document-extractor/
 ├── pyproject.toml
 ├── .gitignore                 # data/, *.db, .DS_Store, real PDFs
 ├── config/
-│   ├── config.yaml            # §6
-│   └── templates/             # per-issuer parsing templates (§8.4)
+│   └── config.yaml            # §6
 ├── data/                      # gitignored
 │   ├── vault/                 # input PDFs
+│   ├── templates/             # learned layout templates (§8.4); derived from confidential PDFs
 │   └── app.db
 ├── src/docintel/
 │   ├── __init__.py
-│   ├── config.py              # load/validate config.yaml + templates (Pydantic)
+│   ├── config.py              # load/validate config.yaml (Pydantic)
 │   ├── ingest.py              # discovery, hashing, status machine
 │   ├── pdf_extract.py         # per-page text, OCR trigger + fallback
 │   ├── classify.py            # document_type (rules → LLM fallback)
-│   ├── field_extract.py       # rules + LLM JSON extraction
+│   ├── templates.py           # layout fingerprints, template matching, induction, lifecycle (§8.4)
+│   ├── field_extract.py       # apply a template, or LLM extraction for new formats
 │   ├── validate.py            # arithmetic, formats, Pydantic models
 │   ├── db.py                  # schema DDL, migrations, connections
 │   ├── retrieval.py           # Retriever interface; ExactRetriever, FTSRetriever
@@ -182,7 +184,13 @@ agent:
   max_tool_calls: 6
   max_retries_per_tool: 1
 extraction:
-  use_llm_fallback: true        # rules first; LLM only for unresolved fields
+  templates_dir: data/templates
+  use_llm_fallback: true        # templates first; LLM only for new formats and near misses
+  template_match:
+    required_threshold: 0.80    # below this share of required labels found -> new format (§8.4)
+    moved_tolerance: 0.10       # label centre displaced more than this (fraction of page) -> "moved"
+    label_similarity: 0.90      # fuzzy label match ratio (tolerates OCR misreads)
+    probation_docs: 3           # documents double-checked by the LLM before a template is trusted
 answer:
   default_currency_display: true
 ```
@@ -210,7 +218,10 @@ CREATE TABLE documents (
                    ('discovered','text_extracted','ocr_required','ocr_completed',
                     'fields_extracted','validated','needs_review','failed')),
   error_message   TEXT,
-  last_processed_at TEXT
+  last_processed_at TEXT,
+  template_id     TEXT,                      -- schema v3 (M2): template that parsed it, NULL if LLM-only
+  template_version INTEGER,                  -- schema v3 (M2)
+  template_match  TEXT CHECK(template_match IN ('match','near_miss','no_match'))  -- schema v3 (M2)
 );
 
 -- page_id is an explicit INTEGER PRIMARY KEY: the FTS index points at it, and a
@@ -223,6 +234,8 @@ CREATE TABLE document_pages (
   extraction_method TEXT NOT NULL CHECK(extraction_method IN ('pymupdf','ocr')),
   char_count      INTEGER NOT NULL,
   text_quality    TEXT NOT NULL CHECK(text_quality IN ('ok','low','empty')),
+  words_json      TEXT,                      -- schema v2 (M1): [[x0,y0,x1,y1,"word"],...], coords
+                                             -- normalised to 0..1 of page size; feeds layout fingerprints
   UNIQUE (document_id, page_number)
 );
 
@@ -259,7 +272,11 @@ CREATE TABLE field_evidence (
   normalized_value TEXT,
   source_page     INTEGER,                   -- 1-based
   supporting_text TEXT,                      -- ≤ 300 chars around the value
-  extraction_method TEXT NOT NULL,           -- 'template:<id>' | 'rule' | 'llm' | 'llm_bootstrap' (§8.4)
+  extraction_method TEXT NOT NULL,           -- 'template:<id>.v<n>' | 'llm' (§8.4)
+  presence        TEXT NOT NULL CHECK(presence IN ('found','absent','not_covered')),
+                                             -- schema v3 (M2). absent = the template has a rule for this
+                                             -- field and its label is not on the page; not_covered = the
+                                             -- template has no rule for it. Only 'absent' can support not_found.
   validation_status TEXT NOT NULL CHECK(validation_status IN ('valid','warning','needs_review'))
 );
 CREATE INDEX idx_evidence_record ON field_evidence(record_id, field_name);
@@ -279,6 +296,20 @@ CREATE TABLE query_log (
   answer          TEXT
 );
 
+-- schema v3 (M2): lifecycle state of learned templates. The rules themselves live in
+-- data/templates/<template_id>.v<version>.yaml; yaml_sha256 detects hand edits.
+CREATE TABLE templates (
+  template_id     TEXT NOT NULL,             -- 'tpl_' + 8 hex of the sorted required labels
+  version         INTEGER NOT NULL,
+  status          TEXT NOT NULL CHECK(status IN ('probation','trusted','retired')),
+  learned_from    TEXT NOT NULL REFERENCES documents(document_id),
+  docs_agreed     INTEGER NOT NULL DEFAULT 0, -- probation documents where template == LLM
+  docs_disagreed  INTEGER NOT NULL DEFAULT 0,
+  yaml_sha256     TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (template_id, version)
+);
+
 -- Phase 2 only (do NOT create in v1): chunks + vec0 virtual table (sqlite-vec),
 -- document_links (matching). See §9.
 ```
@@ -293,15 +324,18 @@ Line items (`record_line_items`) are **deferred — confirmed by the project own
 
 - Recursively scan `vault_dir` for `*.pdf` (case-insensitive). Ignore hidden files and `.DS_Store`-style junk.
 - SHA-256 each file → `document_id = 'doc_' + hash[:12]`. Upsert into `documents`.
-- Idempotency: same hash + status ≥ `text_extracted` → skip. Same path, new hash → new document row; old row keeps its data, gains `error_message = 'superseded by <new_id>'` and the registry reports it. (Policy: hash identity, documented in README.)
+- Idempotency: a document is its content hash. Unchanged hash → skip (unless `--force`). Renamed or moved file → same document, path updated, not re-read. Identical copies → stored once, reported as duplicates. Changed content → a new document; the old version's row is deleted, not kept as "superseded", because two versions of one invoice would turn clean questions into false `ambiguous` answers.
+- The database mirrors the vault: rows whose content is no longer on disk are deleted on every `ingest`, cascading to pages, records, evidence and the search index.
+- Retries: `discovered` (interrupted run) is always retried; `ocr_required` is retried once OCR becomes available; `failed` is retried only with `--force` (the file is unchanged, so it would fail again).
 - Running `ingest` twice on an unchanged vault must be a no-op (acceptance test).
 - Every stage transition updates `processing_status`; every exception lands in `failed` with `error_message`. **No silent drops**: count(files on disk) must equal count(rows in `documents`) after every run.
 
 ### 8.2 `pdf_extract.py`
 
 - Per page: `page.get_text("text")`. Store text, `char_count`, method `pymupdf`.
+- Also store `page.get_text("words")` as `words_json`, with coordinates divided by page width/height so they are comparable across page sizes. M2's layout fingerprints are built from these; storing them now means ingestion never has to reopen a PDF to learn a template. OCR'd pages get theirs from the OCR text layer.
 - Quality: `empty` (<4 alnum chars), `low` (< `min_chars_per_page`), else `ok`.
-- Pages `empty`/`low` and `ocr.enabled` → run OCRmyPDF on the document with `--skip-text` (only OCRs image pages), re-extract those pages, method `ocr`. OCR failure → document status `ocr_required` + `needs_review`, never `failed`-and-forgotten; these feed the coverage report.
+- Pages `empty`/`low` and `ocr.enabled` → OCR those pages with PyMuPDF's Tesseract integration, method `ocr`. An `empty` page is OCR'd in full; a `low` page only has its images OCR'd, so exact digital text is never replaced by OCR guesses. Tesseract missing, OCR disabled, or OCR erroring → document status `ocr_required` with the reason, never `failed`-and-forgotten; these feed the coverage report and make it incomplete. A document with no text on any page even after OCR → `failed` (nothing in it is searchable).
 - Known OCR hazards (0/O, 1/I, decimal points) are *not* fixed here — flagged downstream by validation.
 - Corpus expectation: predominantly digital PDFs, but scanned documents ARE in scope for v1 — the OCR path is a required, tested feature (fixture corpus includes a scanned PDF), not a stub.
 
@@ -313,27 +347,42 @@ Line items (`record_line_items`) are **deferred — confirmed by the project own
 
 ### 8.4 `field_extract.py` + `validate.py`
 
-**Template registry (rules are organized per document family, not one global regex pile).**
-Documents from the same issuer share a layout, so deterministic parsers are grouped
-into *templates* and reused across the family:
+**Learned layout templates (D7).** The vault's PDFs come in generic, unknown formats. Each format is learned once, by the LLM, and every later document of that format is parsed by plain Python. Lives in `templates.py`.
 
-- A template = `{template_id, fingerprint, parsers}` where `fingerprint` is a small
-  set of anchor strings expected on page 1 (issuer name, characteristic labels) and
-  `parsers` are the per-field rules below. Templates live in `config/templates/`
-  (one YAML per family) so adding a new issuer is configuration, not code surgery.
-- Extraction flow per document: match fingerprint → run that template's parsers.
-  Parsers anchor on **labels** ("Invoice No:", "Grand Total"), not absolute positions,
-  so minor layout drift within a family doesn't break them.
-- A matched template whose *required* fields come back empty falls through to the
-  LLM path (never silently stores nulls). No fingerprint match (a brand-new format)
-  → LLM-assisted extraction, record flagged `needs_review`; if that issuer recurs,
-  a new template is added. The LLM bootstraps new formats; templates do the
-  everyday parsing. Record which template (or `llm_bootstrap`) handled each
-  document in `field_evidence.extraction_method`.
+*1. Labels and fingerprints.* A **label** is a short text span on the page that names a value: it ends in `:` or `#`, or matches the field-label lexicon (`invoice no`, `date`, `total`, `vat`, ...), or is the large-font document title. Labels are normalised (casefolded; digits, punctuation and extra whitespace removed) and carry their page number and the centre of their bounding box, from `words_json`. A template's **fingerprint** is its labels, split into:
+- **required labels**: the document title plus the labels anchoring the core fields (record number, record date, total). They identify the format.
+- **optional labels**: anchors of every other field (due date, PO reference, tax, subtotal, payment terms, ...) and known non-field labels ("Bill To:", "Page 1 of 2"). They may or may not appear on a given document.
 
-**Rules first** (regex per field, built against the fixture corpus): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (captured via each template's labelled pattern; an optional per-template `tax_id_format` regex acts as a *format check only* — never repair characters, and never hardcode one jurisdiction's format such as GSTIN into code), currency (symbol/code detection; none found → NULL — never default to any currency).
+A template learned from one document cannot know which fields are only sometimes printed, so only the core fields are required and everything else is optional by default.
 
-**LLM fallback** for fields rules couldn't fill: prompt = full document text (page-tagged `[[page 3]]`), target JSON schema, and instructions — *extract only what is printed; use null for absent fields; copy values verbatim into `raw_value`; report the page number for each field*. Output validated by Pydantic; invalid JSON → one retry → `needs_review`.
+*2. Matching.* For each document, compare against every active template (status `probation` or `trusted`). A required label is **found** if a label on the same page has fuzzy similarity ≥ `label_similarity` (0.90, tolerating OCR misreads), and **moved** if it was found but its centre is more than `moved_tolerance` (0.10 of the page) from where the template expects it. Score = required labels found ÷ required labels. Outcome:
+
+| Outcome | Condition | Action |
+|---|---|---|
+| **match** | score = 1.0, no required label moved, and no unknown label on the document | Apply the template. Python only, no LLM. |
+| **near miss** | score ≥ `required_threshold` (**0.80**) but not a match: a required label missing, a required label moved, or a label on the document that the template does not know (e.g. a new "Discount:" line) | Do not apply it. Extract with the LLM and learn a new **version** of that template (same `template_id`, `version + 1`). |
+| **no match** | score < 0.80 against every template | New format: extract with the LLM and learn a new template. |
+
+With four required labels, 0.80 means one missing required label already falls below the threshold (3/4 = 0.75), so in practice a near miss is a moved or unknown label. The threshold matters for formats with five or more required labels. Matching errs strict on purpose: a false near miss costs one extra LLM call; a false match produces confident wrong values. If two templates both match, the one with more required labels wins; a tie is treated as a near miss.
+
+A field missing in one format but present in another is **not** a problem: each format's template only has rules for the fields that format prints, and a document whose format never prints a field stores it as `not_covered`. An optional field missing from one document of a format (one invoice without a due date) is stored as `absent` and does not affect matching.
+
+*3. Learning a template (new format or near miss).* The LLM supplies **values**; code induces the **rules**. A 7B model is far more reliable at reading values than at writing parsers.
+1. LLM extraction, as in "LLM extraction" below: JSON with each field's raw value and page.
+2. Verbatim gate: each raw value must appear in the claimed page's text. Failing fields are dropped and the document goes to `needs_review`.
+3. Induction, in plain Python: locate each value's words in `words_json`; its anchor is the nearest label on the same line to the left, or else directly above. Record the field, the anchor label, the relation (`right_of` | `below`), the value type (`date` | `amount` | `id` | `text`), page, and expected position. A value with no nearby label gets no rule and stays `not_covered` for this template.
+4. Self-check: apply the induced template to the same document. It must reproduce every LLM value exactly (after normalisation). If not, nothing is saved and the document goes to `needs_review`; its LLM values are still stored if they passed the verbatim gate.
+5. Save `data/templates/<template_id>.v<n>.yaml` (human-readable; header says it was generated and from which document) and a `templates` row with status `probation`.
+
+*4. Probation and trust.* The next `probation_docs` (3) documents that match a probation template are extracted twice, by the template and by the LLM, and compared field by field. Agreement increments `docs_agreed`; at 3 the template becomes `trusted` and later documents use Python only. A disagreement sends that document to `needs_review` and increments `docs_disagreed`; at 2 the template is `retired` and the next document of that layout is learned afresh. If a template's YAML is edited by hand (its `yaml_sha256` changes), it goes back to probation.
+
+*5. Drift on a trusted template.* If a matched template leaves a required field empty or the record fails validation (e.g. subtotal + tax ≠ total), that document falls back to the LLM and goes through step 3 as a near miss, proposing a new version. The old version is never overwritten; documents that still match it keep using it.
+
+*6. Provenance.* Every field the template has a rule for writes a `field_evidence` row: `presence='found'` with its value, or `presence='absent'` if the label is not on the page. Every schema field the template has no rule for writes `presence='not_covered'`. `extraction_method` records `template:<id>.v<n>` or `llm`. Learned templates are derived from confidential documents, so they live under `data/` (gitignored), not `config/`.
+
+**Value parsers** (shared by all templates; applied to the text a template's anchor points at): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (captured via each template's labelled pattern; an optional per-template `tax_id_format` regex acts as a *format check only* — never repair characters, and never hardcode one jurisdiction's format such as GSTIN into code), currency (symbol/code detection; none found → NULL — never default to any currency).
+
+**LLM extraction** (new formats, near misses, probation double-checks): prompt = full document text (page-tagged `[[page 3]]`), target JSON schema, and instructions — *extract only what is printed; use null for absent fields; copy values verbatim into `raw_value`; report the page number for each field*. Output validated by Pydantic; invalid JSON → one retry → `needs_review`.
 
 **Every accepted field writes a `field_evidence` row.** For LLM-extracted fields, verify `raw_value` actually appears in the claimed page's text (whitespace-normalized substring match); mismatch → `needs_review`, not stored as `valid`. This is the anti-hallucination gate at ingestion time.
 
@@ -386,10 +435,13 @@ def get_coverage() -> dict
 ```
 evidence found & unambiguous & covers the whole question   → supported
 evidence covers some requested fields only                 → partial
-no evidence & coverage complete (per get_coverage)         → not_found
+no evidence & coverage complete (per get_coverage)
+  & field 'absent' or a full-text search found nothing      → not_found
 >1 candidate for a unique identifier, or conflicting values→ ambiguous
 no/weak evidence & coverage incomplete, or budget exhausted→ incomplete
 ```
+
+A field stored as `not_covered` is never evidence of absence on its own: before answering `not_found` for it, the agent must run `search_text` over that document's pages, since the value may be printed but not extracted.
 
 Then the composer LLM gets: question, status (fixed), evidence list, computed values, coverage stats — and writes 1–4 sentences consistent with that status, citing `filename p.N` for each claim.
 
@@ -409,7 +461,7 @@ docintel eval                    # run eval/questions.jsonl, write eval/results/
 
 ### 8.8 Fixtures
 
-`tests/fixtures/make_fixtures.py` generates (with fpdf2) a synthetic corpus committed as a *script*, not PDFs, plus a `manifest.json` ground truth (per field: raw text, normalized value, page): ~12 invoices (2 suppliers, varied date formats, one with leading-zero number, one duplicate invoice number across suppliers, one missing due date), ~4 purchase orders (two referenced by invoices via `po_reference`), 1 image-only "scanned" PDF (OCR path), 1 corrupt/empty PDF (failure path). All tests and the eval set run against this corpus; real invoices never enter the repo.
+`tests/fixtures/make_fixtures.py` generates (with fpdf2) a synthetic corpus committed as a *script*, not PDFs, plus a `manifest.json` ground truth (per field: raw text, normalized value, page): ~12 invoices (2 suppliers, varied date formats, one with leading-zero number, one duplicate invoice number across suppliers, one missing due date), ~4 purchase orders (two referenced by invoices via `po_reference`), 1 image-only "scanned" PDF (OCR path), 1 corrupt/empty PDF (failure path). M2 adds template-matching cases: a Northwind variant with an extra "Discount:" line (near miss → new version), a third, unseen layout (no match → new template), and a scanned document of a known layout (match through fuzzy OCR labels). All tests and the eval set run against this corpus; real invoices never enter the repo.
 
 ---
 
@@ -466,18 +518,18 @@ Each milestone gates the next; "done" = its tests pass.
 | M | Build | Acceptance |
 |---|---|---|
 | **M0** | Repo scaffold, `pyproject.toml`, config loader, DB schema (§7), fixture generator | `pytest tests/test_ingest.py -k schema` green; fixtures generate deterministically |
-| **M1** | `ingest.py` + `pdf_extract.py` (incl. OCR path + failure path) | every fixture file accounted for in `documents`; re-run is a no-op; corrupt file → `failed` with message; scanned file → OCR text present |
-| **M2** | `classify.py` + `field_extract.py` + `validate.py` (rules first, then LLM fallback) + `field_evidence` writes | fields on fixtures ≥95% correct via rules alone; every stored field has an evidence row; planted LLM-hallucination case (raw_value not in page text) lands in `needs_review` |
+| **M1** | `ingest.py` + `pdf_extract.py` (incl. OCR path + failure path, `words_json`), CLI `ingest`/`status` | every fixture file accounted for in `documents`; re-run is a no-op; corrupt file → `failed` with message; scanned file → OCR text present, or `ocr_required` if Tesseract is not installed (never silently empty) |
+| **M2** | `classify.py` + `templates.py` + `field_extract.py` + `validate.py` + `field_evidence` writes (schema v3) | each fixture layout is learned from its first document and later documents of it parse with no LLM call; the near-miss variant yields a new version and the unseen layout a new template; fields on fixtures ≥95% correct; every schema field has an evidence row with the right `presence`; planted LLM-hallucination case (raw_value not in page text) lands in `needs_review`. Template-learning tests use a scripted fake LLM, so they need no Ollama |
 | **M3** | `db.py` retrieval + `retrieval.py` + FTS5 + the 5 tools (§8.5), tested directly (no agent yet) | exact lookup, filters, sum/count (incl. mixed-currency refusal), FTS snippets, coverage — all correct from unit tests |
 | **M4** | `llm.py` (both drivers) + `agent.py` + `compose.py` + verifier + `cli.py ask` | tool budget enforced; statuses assigned per §8.6 truth table on scripted tool traces (unit-testable without an LLM); G1/G2 verifier tests green |
 | **M5** | `eval/` suite + `docintel eval` + README with demo script & limitations | all 20–30 eval questions pass on at least one driver; false-answer rate 0 on fixtures; both drivers' reports generated |
 
 Risk register the builder should keep in mind (condensed from the handoff §18, all adopted): OCR misreads digits → validation + needs_review, never auto-correct; model emits valid-but-wrong JSON → substring provenance check (M2); SQL injection → parameterized whitelisted templates only; agent loops → hard call budget; chunking losing page refs → provenance carried through every stage; duplicate IDs → never assume uniqueness; "no results" ≠ "absent" → coverage gate (G4).
 
-**Likely bottlenecks** (set expectations): local-LLM tool-calling reliability (mitigation: D2 config switch + eval comparison), OCR throughput/quality on poor scans (mitigation: per-page trigger, review queue), extraction drift as new invoice layouts appear (mitigation: per-issuer template registry in config, label-anchored parsers tolerate minor drift, LLM bootstraps unmatched formats into review), and the honest limit that no system can prove universal absence — only absence within a well-covered, well-extracted collection, which is exactly what `search_coverage` quantifies.
+**Likely bottlenecks** (set expectations): local-LLM tool-calling reliability (mitigation: D2 config switch + eval comparison), OCR throughput/quality on poor scans (mitigation: per-page trigger, review queue), new and drifting layouts (mitigation: learned templates with an 80% required-label threshold, strict matching, self-check, probation, versioning instead of overwriting; §8.4), a wrong template applied with confidence (mitigation: strict matching plus arithmetic validation), "not extracted" mistaken for "not printed" (mitigation: `presence` column and the full-text check in §8.6), and the honest limit that no system can prove universal absence — only absence within a well-covered, well-extracted collection, which is exactly what `search_coverage` quantifies.
 
 ---
 
 ## 12. Security & privacy (adopted from handoff §17, binding)
 
-Real invoices, extracted text, and `app.db` never enter version control (`.gitignore` enforced from M0). Default config sends nothing off-machine; switching `llm.provider` to a hosted driver is an explicit user decision and the README must say what leaves the machine when they do. The query agent's DB handle is read-only; tools whitelist columns and operations; PDF text is always data, never instructions. Keep a documented way to purge all derived data for a removed source file (`docintel ingest --force` after deletion must drop orphaned rows — include in M1 acceptance).
+Real invoices, extracted text, and `app.db` never enter version control (`.gitignore` enforced from M0). Default config sends nothing off-machine; switching `llm.provider` to a hosted driver is an explicit user decision and the README must say what leaves the machine when they do. The query agent's DB handle is read-only; tools whitelist columns and operations; PDF text is always data, never instructions. Deleting a source file and running `docintel ingest` purges everything derived from it: its rows, pages, records, evidence and search entries (M1, tested).

@@ -10,7 +10,6 @@ import hashlib
 
 import pymupdf
 import pytest
-
 from fixtures.make_fixtures import generate_corpus
 
 
@@ -91,7 +90,8 @@ def test_fixtures_contain_the_planned_edge_cases(corpus):
     assert two_page["fields"]["record_number"]["page"] == 1
 
     # Invoices cite POs that exist in the corpus.
-    po_numbers = {d["fields"]["record_number"]["value"] for d in docs.values() if d["document_type"] == "purchase_order"}
+    orders = [d for d in docs.values() if d["document_type"] == "purchase_order"]
+    po_numbers = {d["fields"]["record_number"]["value"] for d in orders}
     cited = {d["fields"]["po_reference"]["value"] for d in invoices if "po_reference" in d["fields"]}
     assert cited and cited <= po_numbers
 

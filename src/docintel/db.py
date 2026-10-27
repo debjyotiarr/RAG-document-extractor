@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 # Bump this and add a step to `_MIGRATIONS` whenever the schema changes.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DOCUMENT_TYPES = ("invoice", "purchase_order", "credit_note", "other", "unknown")
 RECORD_TYPES = ("invoice", "purchase_order", "credit_note")
@@ -128,8 +128,14 @@ CREATE TABLE query_log (
 );
 """
 
+# v2 (M1): word positions per page, the input for layout fingerprints (BLUEPRINT §8.4).
+# JSON list of [x0, y0, x1, y1, word, block, line], coordinates normalised to 0..1 of the page.
+_SCHEMA_V2 = """
+ALTER TABLE document_pages ADD COLUMN words_json TEXT;
+"""
+
 # _MIGRATIONS[n] upgrades a database from version n to version n + 1.
-_MIGRATIONS = {0: _SCHEMA_V1}
+_MIGRATIONS = {0: _SCHEMA_V1, 1: _SCHEMA_V2}
 
 
 class SchemaVersionError(Exception):

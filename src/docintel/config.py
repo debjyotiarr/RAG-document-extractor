@@ -52,9 +52,19 @@ class AgentConfig(_Section):
     max_retries_per_tool: int = Field(1, ge=0, le=3)
 
 
+class TemplateMatchConfig(_Section):
+    # BLUEPRINT §8.4: below this share of required labels found, a document is a new format.
+    required_threshold: float = Field(0.80, gt=0, le=1)
+    moved_tolerance: float = Field(0.10, gt=0, le=1)
+    label_similarity: float = Field(0.90, gt=0, le=1)
+    probation_docs: int = Field(3, ge=0)
+
+
 class ExtractionConfig(_Section):
-    templates_dir: Path = Path("config/templates")
+    # Learned templates are derived from the vault's PDFs, so they live under data/ (gitignored).
+    templates_dir: Path = Path("data/templates")
     use_llm_fallback: bool = True
+    template_match: TemplateMatchConfig = TemplateMatchConfig()
 
 
 class Config(_Section):
