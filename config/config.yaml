@@ -23,5 +23,10 @@ agent:
   max_retries_per_tool: 1
 
 extraction:
-  templates_dir: config/templates
-  use_llm_fallback: true        # templates first; LLM only for unmatched formats or empty required fields
+  templates_dir: data/templates   # learned layout templates; derived from your PDFs, so gitignored
+  use_llm_fallback: true        # templates first; LLM only for new formats and near misses
+  template_match:
+    required_threshold: 0.80    # share of required labels that must be found, else new format
+    moved_tolerance: 0.10       # label centre moved more than this (fraction of page) counts as moved
+    label_similarity: 0.90      # fuzzy label match ratio (tolerates OCR misreads)
+    probation_docs: 3           # documents double-checked by the LLM before a template is trusted

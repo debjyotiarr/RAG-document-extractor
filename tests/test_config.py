@@ -20,7 +20,9 @@ def test_repo_config_loads_with_pinned_decisions():
     config = load_config(DEFAULT_CONFIG_PATH)
     assert config.vault_dir == PROJECT_ROOT / "data" / "vault"
     assert config.db_path == PROJECT_ROOT / "data" / "app.db"
-    assert config.extraction.templates_dir == PROJECT_ROOT / "config" / "templates"
+    assert config.extraction.templates_dir == PROJECT_ROOT / "data" / "templates"
+    assert config.extraction.template_match.required_threshold == 0.80
+    assert config.extraction.template_match.probation_docs == 3
     assert config.llm.provider == "ollama"
     assert config.llm.ollama.model == "qwen2.5:7b-instruct"
     assert config.agent.max_tool_calls == 6
@@ -65,6 +67,7 @@ def test_missing_file_raises(tmp_path):
         ("llm:\n  provider: openai\n", "provider"),
         ("agent:\n  max_tool_calls: 0\n", "max_tool_calls"),
         ("ocr:\n  enabled: true\n  min_chars: 10\n", "min_chars"),
+        ("extraction:\n  template_match:\n    required_threshold: 1.5\n", "required_threshold"),
     ],
 )
 def test_invalid_config_raises_with_useful_message(tmp_path, text, message):

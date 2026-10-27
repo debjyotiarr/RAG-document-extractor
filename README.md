@@ -21,7 +21,7 @@ Put PDFs in `data/vault/`, which is the default vault. To use a different folder
 
 ```
 config/config.yaml      settings (vault path, OCR, Ollama model, agent limits)
-config/templates/       per-issuer parsing templates
+data/templates/         layout templates learned from your PDFs (gitignored)
 data/vault/             input PDFs (gitignored)
 src/docintel/           the package, with one module per pipeline stage
 tests/                  pytest suite and synthetic fixture generator
