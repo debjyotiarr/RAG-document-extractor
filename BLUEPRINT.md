@@ -143,7 +143,10 @@ RAG-document-extractor/
 │   ├── llm.py                 # LLMClient + ollama/anthropic drivers
 │   └── cli.py                 # ingest / status / ask / eval commands
 ├── tests/
-│   ├── fixtures/make_fixtures.py   # generates synthetic invoice+order PDFs
+│   ├── conftest.py                 # session-scoped fixture corpus
+│   ├── fixtures/make_fixtures.py   # generates synthetic invoice+order PDFs + manifest.json
+│   ├── test_config.py
+│   ├── test_fixtures.py            # ground truth matches printed text; determinism
 │   ├── test_ingest.py
 │   ├── test_pdf_extract.py
 │   ├── test_field_extract.py
@@ -210,20 +213,23 @@ CREATE TABLE documents (
   last_processed_at TEXT
 );
 
+-- page_id is an explicit INTEGER PRIMARY KEY: the FTS index points at it, and a
+-- hidden rowid (composite-key table) can be renumbered by VACUUM.
 CREATE TABLE document_pages (
-  document_id     TEXT NOT NULL REFERENCES documents(document_id),
-  page_number     INTEGER NOT NULL,          -- 1-based (user-facing)
+  page_id         INTEGER PRIMARY KEY,
+  document_id     TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+  page_number     INTEGER NOT NULL CHECK(page_number >= 1),  -- 1-based (user-facing)
   page_text       TEXT,
   extraction_method TEXT NOT NULL CHECK(extraction_method IN ('pymupdf','ocr')),
   char_count      INTEGER NOT NULL,
   text_quality    TEXT NOT NULL CHECK(text_quality IN ('ok','low','empty')),
-  PRIMARY KEY (document_id, page_number)
+  UNIQUE (document_id, page_number)
 );
 
 -- One row per extracted business record (invoice OR purchase order).
 CREATE TABLE records (
   record_id       INTEGER PRIMARY KEY,
-  document_id     TEXT NOT NULL REFERENCES documents(document_id),
+  document_id     TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
   record_type     TEXT NOT NULL CHECK(record_type IN ('invoice','purchase_order','credit_note')),
   counterparty_name_raw TEXT,                -- supplier (invoice) / vendor (PO)
   counterparty_name_norm TEXT,               -- casefolded, whitespace-collapsed
@@ -247,20 +253,20 @@ CREATE INDEX idx_records_date   ON records(record_date);
 -- MANDATORY (D4): per-field provenance.
 CREATE TABLE field_evidence (
   evidence_id     INTEGER PRIMARY KEY,
-  record_id       INTEGER NOT NULL REFERENCES records(record_id),
+  record_id       INTEGER NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
   field_name      TEXT NOT NULL,
   raw_value       TEXT,                      -- exactly as printed in the PDF
   normalized_value TEXT,
   source_page     INTEGER,                   -- 1-based
   supporting_text TEXT,                      -- ≤ 300 chars around the value
-  extraction_method TEXT NOT NULL CHECK(extraction_method IN ('rule','llm')),
+  extraction_method TEXT NOT NULL,           -- 'template:<id>' | 'rule' | 'llm' | 'llm_bootstrap' (§8.4)
   validation_status TEXT NOT NULL CHECK(validation_status IN ('valid','warning','needs_review'))
 );
 CREATE INDEX idx_evidence_record ON field_evidence(record_id, field_name);
 
 -- Full-text search over page text (external content).
 CREATE VIRTUAL TABLE pages_fts USING fts5(
-  page_text, content='document_pages', content_rowid='rowid'
+  page_text, content='document_pages', content_rowid='page_id'
 );
 -- plus the standard FTS5 external-content triggers on document_pages.
 
@@ -403,7 +409,7 @@ docintel eval                    # run eval/questions.jsonl, write eval/results/
 
 ### 8.8 Fixtures
 
-`tests/fixtures/make_fixtures.py` generates (with reportlab or fpdf2) a synthetic corpus committed as a *script*, not PDFs: ~12 invoices (2 suppliers, varied date formats, one with leading-zero number, one duplicate invoice number across suppliers, one missing due date), ~4 purchase orders (two referenced by invoices via `po_reference`), 1 image-only "scanned" PDF (OCR path), 1 corrupt/empty PDF (failure path). All tests and the eval set run against this corpus; real invoices never enter the repo.
+`tests/fixtures/make_fixtures.py` generates (with fpdf2) a synthetic corpus committed as a *script*, not PDFs, plus a `manifest.json` ground truth (per field: raw text, normalized value, page): ~12 invoices (2 suppliers, varied date formats, one with leading-zero number, one duplicate invoice number across suppliers, one missing due date), ~4 purchase orders (two referenced by invoices via `po_reference`), 1 image-only "scanned" PDF (OCR path), 1 corrupt/empty PDF (failure path). All tests and the eval set run against this corpus; real invoices never enter the repo.
 
 ---
 

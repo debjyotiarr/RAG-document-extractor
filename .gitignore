@@ -22,3 +22,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
+
+# Generated fixture corpus (regenerate with tests/fixtures/make_fixtures.py)
+tests/fixtures/corpus/

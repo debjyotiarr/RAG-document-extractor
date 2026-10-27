@@ -4,7 +4,9 @@ Build a system to extract information from PDFs (invoices and purchase orders), 
 
 ## Status
 
-Milestone M0, in progress. The folder structure is in place, and the modules are still empty.
+Milestone M0 is complete: config loader (`src/docintel/config.py`), SQLite schema (`src/docintel/db.py`) and the synthetic fixture corpus (`tests/fixtures/make_fixtures.py`), with tests. The pipeline modules are still empty; M1 (PDF ingestion and OCR) is next.
+
+Run the tests with `pytest`. To look at the fixture PDFs, run `python tests/fixtures/make_fixtures.py` and open `tests/fixtures/corpus/`.
 
 ## Where the PDFs go
 
