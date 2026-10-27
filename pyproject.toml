@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docintel"
+version = "0.1.0"
+description = "Agentic, grounded Q&A over a local vault of invoice and order PDFs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf>=1.24",
+    "ocrmypdf>=16",      # also needs the Tesseract binary installed on the system
+    "pydantic>=2.6",
+    "pyyaml>=6",
+    "ollama>=0.4",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+dev = ["pytest>=8", "fpdf2>=2.7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
