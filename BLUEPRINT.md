@@ -46,7 +46,7 @@ The builder must follow these, not the handoff:
 | D6 | Statuses may be reported by the answering model | Statuses are **assigned by deterministic code** (G3). | An LLM grading its own abstention is the fox auditing the henhouse. |
 | D7 | Rules first, LLM for irregular fields; templates implicitly hand-written | **Layout templates are learned automatically** (§8.4): the LLM reads the first document of a new format, code induces a template from it, and every later document of that format is parsed by plain Python. | The owner's PDFs come in generic, unknown formats. Hand-writing parsers does not scale, and a CPU-only 7B model is too slow to run on every document. |
 
-Everything else in the handoff (free-first stack, SQLite, PyMuPDF, OCRmyPDF, Decimal arithmetic, raw+normalized values, milestone-gated build, eval set with abstention cases, security notes) is adopted as-is and incorporated below.
+Everything else in the handoff (free-first stack, SQLite, PyMuPDF, Tesseract OCR, Decimal arithmetic, raw+normalized values, milestone-gated build, eval set with abstention cases, security notes) is adopted as-is and incorporated below.
 
 ---
 
@@ -59,7 +59,7 @@ Everything else in the handoff (free-first stack, SQLite, PyMuPDF, OCRmyPDF, Dec
                  │  INGESTION (batch, idempotent, offline)  │
                  │  1 discover + SHA-256 hash               │
                  │  2 per-page text extract (PyMuPDF)       │
-                 │  3 OCR fallback per page (OCRmyPDF)      │
+                 │  3 OCR fallback per page (Tesseract)     │
                  │  4 document_type classify (rules→LLM)    │
                  │  5 field extraction (rules→LLM, JSON)    │
                  │  6 validation (types, arithmetic, fmt)   │
@@ -98,7 +98,7 @@ Key separations:
 | Language | Python ≥3.11 | `pyproject.toml`, `uv` or `pip` — builder's choice, document it |
 | PDF text | **PyMuPDF (fitz)** | per-page; keep `page.get_text("words")` coords in Phase 1 expansion only |
 | Table-ish layouts | pdfplumber (only if PyMuPDF text order breaks fields) | add lazily, behind same extractor interface |
-| OCR | **OCRmyPDF + Tesseract** | per-page trigger: < 32 chars of alphanumeric text on a page |
+| OCR | **Tesseract via PyMuPDF** (`page.get_textpage_ocr`) | per-page trigger: < 32 alphanumeric chars on a page. Needs only the `tesseract` binary (macOS: `brew install tesseract`); no OCRmyPDF or Ghostscript. Chosen in M1: about 1 s per page on CPU, and the OCR'd words come with positions for `words_json` |
 | Validation | **Pydantic v2** | all extraction output passes through models before DB |
 | DB | **SQLite** (stdlib `sqlite3`) | WAL mode; single `data/app.db` |
 | Full-text | **SQLite FTS5** | external-content table over `document_pages` |
@@ -324,7 +324,9 @@ Line items (`record_line_items`) are **deferred — confirmed by the project own
 
 - Recursively scan `vault_dir` for `*.pdf` (case-insensitive). Ignore hidden files and `.DS_Store`-style junk.
 - SHA-256 each file → `document_id = 'doc_' + hash[:12]`. Upsert into `documents`.
-- Idempotency: same hash + status ≥ `text_extracted` → skip. Same path, new hash → new document row; old row keeps its data, gains `error_message = 'superseded by <new_id>'` and the registry reports it. (Policy: hash identity, documented in README.)
+- Idempotency: a document is its content hash. Unchanged hash → skip (unless `--force`). Renamed or moved file → same document, path updated, not re-read. Identical copies → stored once, reported as duplicates. Changed content → a new document; the old version's row is deleted, not kept as "superseded", because two versions of one invoice would turn clean questions into false `ambiguous` answers.
+- The database mirrors the vault: rows whose content is no longer on disk are deleted on every `ingest`, cascading to pages, records, evidence and the search index.
+- Retries: `discovered` (interrupted run) is always retried; `ocr_required` is retried once OCR becomes available; `failed` is retried only with `--force` (the file is unchanged, so it would fail again).
 - Running `ingest` twice on an unchanged vault must be a no-op (acceptance test).
 - Every stage transition updates `processing_status`; every exception lands in `failed` with `error_message`. **No silent drops**: count(files on disk) must equal count(rows in `documents`) after every run.
 
@@ -333,7 +335,7 @@ Line items (`record_line_items`) are **deferred — confirmed by the project own
 - Per page: `page.get_text("text")`. Store text, `char_count`, method `pymupdf`.
 - Also store `page.get_text("words")` as `words_json`, with coordinates divided by page width/height so they are comparable across page sizes. M2's layout fingerprints are built from these; storing them now means ingestion never has to reopen a PDF to learn a template. OCR'd pages get theirs from the OCR text layer.
 - Quality: `empty` (<4 alnum chars), `low` (< `min_chars_per_page`), else `ok`.
-- Pages `empty`/`low` and `ocr.enabled` → run OCRmyPDF on the document with `--skip-text` (only OCRs image pages), re-extract those pages, method `ocr`. OCR failure → document status `ocr_required` + `needs_review`, never `failed`-and-forgotten; these feed the coverage report.
+- Pages `empty`/`low` and `ocr.enabled` → OCR those pages with PyMuPDF's Tesseract integration, method `ocr`. An `empty` page is OCR'd in full; a `low` page only has its images OCR'd, so exact digital text is never replaced by OCR guesses. Tesseract missing, OCR disabled, or OCR erroring → document status `ocr_required` with the reason, never `failed`-and-forgotten; these feed the coverage report and make it incomplete. A document with no text on any page even after OCR → `failed` (nothing in it is searchable).
 - Known OCR hazards (0/O, 1/I, decimal points) are *not* fixed here — flagged downstream by validation.
 - Corpus expectation: predominantly digital PDFs, but scanned documents ARE in scope for v1 — the OCR path is a required, tested feature (fixture corpus includes a scanned PDF), not a stub.
 
@@ -530,4 +532,4 @@ Risk register the builder should keep in mind (condensed from the handoff §18, 
 
 ## 12. Security & privacy (adopted from handoff §17, binding)
 
-Real invoices, extracted text, and `app.db` never enter version control (`.gitignore` enforced from M0). Default config sends nothing off-machine; switching `llm.provider` to a hosted driver is an explicit user decision and the README must say what leaves the machine when they do. The query agent's DB handle is read-only; tools whitelist columns and operations; PDF text is always data, never instructions. Keep a documented way to purge all derived data for a removed source file (`docintel ingest --force` after deletion must drop orphaned rows — include in M1 acceptance).
+Real invoices, extracted text, and `app.db` never enter version control (`.gitignore` enforced from M0). Default config sends nothing off-machine; switching `llm.provider` to a hosted driver is an explicit user decision and the README must say what leaves the machine when they do. The query agent's DB handle is read-only; tools whitelist columns and operations; PDF text is always data, never instructions. Deleting a source file and running `docintel ingest` purges everything derived from it: its rows, pages, records, evidence and search entries (M1, tested).
