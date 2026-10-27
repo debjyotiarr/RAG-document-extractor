@@ -10,6 +10,9 @@ data/vault/*
 eval/results/*
 !eval/results/.gitkeep
 
+# Local Claude Code settings
+.claude/
+
 # OS junk
 .DS_Store
 
