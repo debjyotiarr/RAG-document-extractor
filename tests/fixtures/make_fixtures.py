@@ -125,6 +125,7 @@ class InvoiceSpec:
     totals_on_page_2: bool = False
     notes: str | None = None
     scanned: bool = False
+    extra_line: str | None = None  # an additional labelled line, for template near-miss tests
 
 
 @dataclass
@@ -234,6 +235,12 @@ class Layout:
     def table(self, header: list[str], rows: list[list[str]]) -> None:
         self.blocks.append(("table", (header, rows)))
 
+    def field_below(self, name: str, label: str, raw: str, value: object) -> None:
+        """Emit a label on its own line with the value on the line below it."""
+        self.blocks.append(("text", label))
+        self.blocks.append(("text", raw))
+        self.fields[name] = {"raw": raw, "value": value, "page": self.page}
+
     def pagebreak(self) -> None:
         self.blocks.append(("pagebreak", None))
         self.page += 1
@@ -298,6 +305,8 @@ def invoice_layout(spec: InvoiceSpec) -> Layout:
         lay.text(s.bank_details)
     if spec.notes:
         lay.text(f"Notes: {spec.notes}")
+    if spec.extra_line:
+        lay.text(spec.extra_line)
     return lay
 
 
@@ -435,6 +444,82 @@ CORRUPT_PDF = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog /Pages 2
 
 
 # --------------------------------------------------------------------- driver
+
+
+KESTREL = Supplier(
+    key="kestrel",
+    name="Kestrel Freight Pty Ltd",
+    address="9 Wharf Street, Fremantle WA 6160",
+    tax_label="ABN",
+    tax_id="51 824 753 556",
+    currency="AUD",
+    tax_rate=Decimal("0.10"),
+    number_style="us",
+    payment_terms="7 days from invoice",
+    payment_days=7,
+    bank_details=None,
+)
+_CATALOG["kestrel"] = [
+    ("Pallet freight, Perth to Adelaide", Decimal("185.00")),
+    ("Fuel surcharge", Decimal("22.50")),
+    ("Tail-lift delivery", Decimal("65.00")),
+]
+
+
+def kestrel_layout(number: str, issued: date) -> Layout:
+    """A third layout: every label on its own line, with its value on the line below."""
+    s = KESTREL
+    items = make_items(s, number, 3)
+    subtotal = sum((total for *_, total in items), Decimal("0"))
+    tax = (subtotal * s.tax_rate).quantize(_CENT, rounding=ROUND_HALF_UP)
+    total = subtotal + tax
+    money = lambda amount: f"{s.currency} {fmt_amount(amount, 'us')}"  # noqa: E731
+    issued_raw = fmt_date(issued, "dmy_short")
+
+    lay = Layout()
+    lay.field("counterparty_name", s.name, s.name, s.name)
+    lay.text(s.address)
+    lay.title("INVOICE")
+    lay.field_below("record_number", "Invoice Number:", number, number)
+    lay.field_below("record_date", "Issue Date:", issued_raw, issued.isoformat())
+    lay.field_below("counterparty_tax_id", "ABN:", s.tax_id, s.tax_id)
+    lay.table(
+        ["Service", "Qty", "Rate", "Charge"],
+        [[d, str(q), fmt_amount(p, "us"), fmt_amount(t, "us")] for d, q, p, t in items],
+    )
+    lay.field_below("subtotal_minor", "Subtotal:", money(subtotal), to_minor(subtotal))
+    lay.field_below("tax_minor", "GST:", money(tax), to_minor(tax))
+    lay.field_below("total_minor", "Amount Payable:", money(total), to_minor(total))
+    lay.field_below("payment_terms", "Terms:", s.payment_terms, s.payment_terms)
+    lay.fields["currency"] = {"raw": money(total), "value": s.currency, "page": 1}  # printed with the amounts
+    return lay
+
+
+def generate_extra_layouts(output_dir: Path | str) -> dict:
+    """Documents for template tests, kept out of the main corpus so its counts stay fixed.
+
+    - two invoices in a third, unseen layout (values below labels): no match, then match
+    - a Northwind invoice with an extra "Discount applied:" line: near miss of the Northwind layout
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    documents = []
+    for number, issued in (("KF-88812", date(2026, 5, 4)), ("KF-88840", date(2026, 5, 18))):
+        lay = kestrel_layout(number, issued)
+        filename = f"invoice_kestrel_{number.lower()}.pdf"
+        (out / filename).write_bytes(render_digital(lay))
+        documents.append({"filename": filename, "document_type": "invoice", "kind": "digital",
+                          "page_count": lay.page, "fields": lay.fields})
+    spec = InvoiceSpec(NORTHWIND, "INV-0048", date(2026, 5, 6), "dmy_short",
+                       extra_line="Discount applied: 5% loyalty discount, included in unit prices")
+    lay = invoice_layout(spec)
+    filename = "invoice_northwind_inv-0048_discount.pdf"
+    (out / filename).write_bytes(render_digital(lay))
+    documents.append({"filename": filename, "document_type": "invoice", "kind": "digital",
+                      "page_count": lay.page, "fields": lay.fields})
+    manifest = {"buyer": _BUYER, "documents": documents}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
 
 
 def generate_corpus(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> dict:

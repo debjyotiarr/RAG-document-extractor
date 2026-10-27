@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 # Bump this and add a step to `_MIGRATIONS` whenever the schema changes.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DOCUMENT_TYPES = ("invoice", "purchase_order", "credit_note", "other", "unknown")
 RECORD_TYPES = ("invoice", "purchase_order", "credit_note")
@@ -134,8 +134,38 @@ _SCHEMA_V2 = """
 ALTER TABLE document_pages ADD COLUMN words_json TEXT;
 """
 
+# v3 (M2): learned layout templates and field presence (BLUEPRINT §8.4).
+_SCHEMA_V3 = """
+ALTER TABLE documents ADD COLUMN template_id TEXT;
+ALTER TABLE documents ADD COLUMN template_version INTEGER;
+ALTER TABLE documents ADD COLUMN template_match TEXT
+  CHECK (template_match IN ('match', 'near_miss', 'no_match'));
+
+-- found = value extracted; absent = the template has a rule for the field and its
+-- label is not on the page; not_covered = no rule for it. Only 'absent' can support
+-- a not_found answer.
+ALTER TABLE field_evidence ADD COLUMN presence TEXT NOT NULL DEFAULT 'found'
+  CHECK (presence IN ('found', 'absent', 'not_covered'));
+
+-- Lifecycle state of learned templates. The rules live in
+-- <templates_dir>/<template_id>.v<version>.yaml; yaml_sha256 detects hand edits.
+CREATE TABLE templates (
+  template_id      TEXT NOT NULL,
+  version          INTEGER NOT NULL,
+  document_type    TEXT NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('probation', 'trusted', 'retired')),
+  learned_from     TEXT REFERENCES documents(document_id) ON DELETE SET NULL,
+  learned_from_file TEXT NOT NULL,
+  docs_agreed      INTEGER NOT NULL DEFAULT 0,
+  docs_disagreed   INTEGER NOT NULL DEFAULT 0,
+  yaml_sha256      TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  PRIMARY KEY (template_id, version)
+);
+"""
+
 # _MIGRATIONS[n] upgrades a database from version n to version n + 1.
-_MIGRATIONS = {0: _SCHEMA_V1, 1: _SCHEMA_V2}
+_MIGRATIONS = {0: _SCHEMA_V1, 1: _SCHEMA_V2, 2: _SCHEMA_V3}
 
 
 class SchemaVersionError(Exception):

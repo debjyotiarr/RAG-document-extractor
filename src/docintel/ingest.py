@@ -7,6 +7,11 @@ is the same document, and an edited file is a new one.
 
 No silent drops: every file ends up in a status, and every failure keeps its
 error message so the coverage report can say exactly what was not searched.
+
+Ingestion has two stages: page text (this module and pdf_extract) and then
+fields (field_extract). A document whose fields could not be extracted yet,
+for example because Ollama was not running, keeps its text, stays searchable,
+and is retried on the next run.
 """
 
 from __future__ import annotations
@@ -20,10 +25,15 @@ from pathlib import Path
 
 from docintel import db, pdf_extract
 from docintel.config import Config
+from docintel.field_extract import extract_document
+from docintel.llm import LLMClient, LLMUnavailable, make_client
 from docintel.pdf_extract import PageText, PdfOpenError
+from docintel.templates import TemplateStore
 
 # Statuses that mean the vault cannot be fully searched (BLUEPRINT G4).
 INCOMPLETE_STATUSES = ("discovered", "ocr_required", "failed")
+# Text is in, fields are not (yet): searchable, but missing from structured queries.
+FIELDS_PENDING_STATUSES = ("text_extracted", "ocr_completed")
 
 
 class VaultError(Exception):
@@ -40,6 +50,8 @@ class IngestReport:
     duplicates: list[tuple[str, str]] = field(default_factory=list)  # (path, identical to path)
     removed: list[str] = field(default_factory=list)  # paths whose content left the vault
     statuses: dict[str, str] = field(default_factory=dict)  # path -> status, for files processed this run
+    extracted: dict[str, str] = field(default_factory=dict)  # path -> status after field extraction
+    fields_pending: dict[str, str] = field(default_factory=dict)  # path -> why extraction was postponed
 
 
 @dataclass
@@ -51,6 +63,8 @@ class Coverage:
     ocr_required: list[tuple[str, str]]
     not_ingested: list[str]  # on disk but not in the database (or changed since)
     missing_from_disk: list[str]  # in the database but no longer on disk
+    fields_pending: list[tuple[str, str]] = field(default_factory=list)  # text read, fields not extracted yet
+    needs_review: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def is_complete(self) -> bool:
@@ -93,8 +107,11 @@ def ingest(
     *,
     force: bool = False,
     on_progress: Callable[[str, str], None] | None = None,
+    on_fields: Callable[[str, object], None] | None = None,
     ocr_check: Callable[[str], str | None] | None = None,
     ocr_run: Callable[..., list[PageText]] | None = None,
+    extract_fields: bool = True,
+    llm: LLMClient | None = None,
 ) -> IngestReport:
     """Bring the database in line with the vault.
 
@@ -102,6 +119,10 @@ def ingest(
     `force` is set. Documents waiting for OCR are retried when OCR has become
     available. `ocr_check` and `ocr_run` default to pdf_extract's real OCR and
     are injectable for tests.
+
+    Then fields are extracted for every document whose text is in but whose
+    fields are not. `llm` defaults to the configured client and is only
+    contacted when a document actually needs it.
     """
     ocr_check = ocr_check or pdf_extract.ocr_unavailable_reason
     ocr_run = ocr_run or pdf_extract.ocr_pages
@@ -156,9 +177,35 @@ def ingest(
                 on_progress(rel, status)
 
         report.removed = _remove_missing(conn, set(seen))
+        if extract_fields:
+            _extract_all(conn, config, llm or make_client(config), report, on_fields)
     finally:
         conn.close()
     return report
+
+
+def _extract_all(conn, config: Config, llm: LLMClient, report: IngestReport, on_fields) -> None:
+    store = TemplateStore(conn, config.extraction.templates_dir, config.extraction.template_match)
+    placeholders = ", ".join("?" for _ in FIELDS_PENDING_STATUSES)
+    rows = conn.execute(
+        f"SELECT document_id, relative_path FROM documents WHERE processing_status IN ({placeholders})"
+        " ORDER BY relative_path",
+        FIELDS_PENDING_STATUSES,
+    ).fetchall()
+    for row in rows:
+        try:
+            outcome = extract_document(conn, row["document_id"], config, llm, store)
+        except LLMUnavailable as exc:
+            reason = f"field extraction pending: {exc}"
+            with conn:
+                conn.execute(
+                    "UPDATE documents SET error_message = ? WHERE document_id = ?", (reason, row["document_id"])
+                )
+            report.fields_pending[row["relative_path"]] = reason
+            continue
+        report.extracted[row["relative_path"]] = outcome.status
+        if on_fields:
+            on_fields(row["relative_path"], outcome)
 
 
 def coverage(config: Config) -> Coverage:
@@ -187,6 +234,13 @@ def coverage(config: Config) -> Coverage:
         ],
         not_ingested=sorted(rel for h, rel in on_disk.items() if h not in in_db),
         missing_from_disk=[r["relative_path"] for r in rows if r["file_hash"] not in on_disk],
+        fields_pending=[
+            (r["relative_path"], r["error_message"] or "fields not extracted yet")
+            for r in present if r["processing_status"] in FIELDS_PENDING_STATUSES
+        ],
+        needs_review=[
+            (r["relative_path"], r["error_message"]) for r in present if r["processing_status"] == "needs_review"
+        ],
     )
 
 

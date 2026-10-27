@@ -301,8 +301,10 @@ CREATE TABLE query_log (
 CREATE TABLE templates (
   template_id     TEXT NOT NULL,             -- 'tpl_' + 8 hex of the sorted required labels
   version         INTEGER NOT NULL,
+  document_type   TEXT NOT NULL,             -- templates only match documents of their own type
   status          TEXT NOT NULL CHECK(status IN ('probation','trusted','retired')),
-  learned_from    TEXT NOT NULL REFERENCES documents(document_id),
+  learned_from    TEXT REFERENCES documents(document_id) ON DELETE SET NULL,
+  learned_from_file TEXT NOT NULL,           -- kept when the teaching document leaves the vault
   docs_agreed     INTEGER NOT NULL DEFAULT 0, -- probation documents where template == LLM
   docs_disagreed  INTEGER NOT NULL DEFAULT 0,
   yaml_sha256     TEXT NOT NULL,
@@ -342,14 +344,15 @@ Line items (`record_line_items`) are **deferred — confirmed by the project own
 ### 8.3 `classify.py` — document type (new vs. handoff, per D3)
 
 1. **Rules first**: case-insensitive keyword scoring on page 1 (`tax invoice`, `invoice no` → invoice; `purchase order`, `po number` → purchase_order; `credit note` → credit_note). Unambiguous score → done, method recorded.
-2. **LLM fallback** (if enabled): page-1 text (truncated ~2000 chars) → strict JSON `{"document_type": "...", "confidence": "high|low"}` validated by Pydantic; `low` → `unknown` + `needs_review`.
+2. **LLM fallback** (if enabled): page-1 text (truncated ~2000 chars) → strict JSON `{"document_type": "...", "confidence": "high|low"}` validated by Pydantic; `low` → `unknown` + `needs_review`. Mixed signals (a credit note that also prints "Invoice No:") are not clear-cut by rules, so they go to the LLM.
 3. `unknown` documents still get page text + FTS indexing (searchable), but no `records` row.
+4. If the LLM is needed but Ollama is not running, the document keeps its text (searchable), is listed as "no fields yet" by `docintel status`, and is retried on the next `ingest`. Documents of trusted layouts need no LLM and are extracted regardless.
 
 ### 8.4 `field_extract.py` + `validate.py`
 
 **Learned layout templates (D7).** The vault's PDFs come in generic, unknown formats. Each format is learned once, by the LLM, and every later document of that format is parsed by plain Python. Lives in `templates.py`.
 
-*1. Labels and fingerprints.* A **label** is a short text span on the page that names a value: it ends in `:` or `#`, or matches the field-label lexicon (`invoice no`, `date`, `total`, `vat`, ...), or is the large-font document title. Labels are normalised (casefolded; digits, punctuation and extra whitespace removed) and carry their page number and the centre of their bounding box, from `words_json`. A template's **fingerprint** is its labels, split into:
+*1. Labels and fingerprints.* A **label** is a short text span on the page that names a value: up to four digit-free words ending in `:`, `#` or `No.` (stopping at a comma, so `Bank: First Harbour Bank, Account No: 0012` gives the labels `bank` and `account no`); or a common label at the start of a line without a colon (`Grand Total EUR 1.225,46`), from a small lexicon; or the document title, a short digit-free line at least 1.25× the page's median word height (OCR boxes hug the glyphs, so a title measures only about 1.3× body text on scans). Labels are normalised (casefolded; digits, punctuation and extra whitespace removed) and carry their page number and the centre of their bounding box, from `words_json`. A template's **fingerprint** is its labels, split into:
 - **required labels**: the document title plus the labels anchoring the core fields (record number, record date, total). They identify the format.
 - **optional labels**: anchors of every other field (due date, PO reference, tax, subtotal, payment terms, ...) and known non-field labels ("Bill To:", "Page 1 of 2"). They may or may not appear on a given document.
 
@@ -363,22 +366,24 @@ A template learned from one document cannot know which fields are only sometimes
 | **near miss** | score ≥ `required_threshold` (**0.80**) but not a match: a required label missing, a required label moved, or a label on the document that the template does not know (e.g. a new "Discount:" line) | Do not apply it. Extract with the LLM and learn a new **version** of that template (same `template_id`, `version + 1`). |
 | **no match** | score < 0.80 against every template | New format: extract with the LLM and learn a new template. |
 
-With four required labels, 0.80 means one missing required label already falls below the threshold (3/4 = 0.75), so in practice a near miss is a moved or unknown label. The threshold matters for formats with five or more required labels. Matching errs strict on purpose: a false near miss costs one extra LLM call; a false match produces confident wrong values. If two templates both match, the one with more required labels wins; a tie is treated as a near miss.
+With four required labels, 0.80 means one missing required label already falls below the threshold (3/4 = 0.75), so in practice a near miss is a moved or unknown label. The threshold matters for formats with five or more required labels. Matching errs strict on purpose: a false near miss costs one extra LLM call; a false match produces confident wrong values. If several templates match, the one with more required labels wins, then the one whose labels overlap the document's most (so a plain invoice prefers v1 over a v2 learned from a variant with an extra line); versions of one template that still tie resolve to the trusted, then newest one, while a tie between *different* templates is treated as a near miss. A near miss's parent is the template the document differs from least structurally (fewest moved, then fewest unknown labels).
+
+Strictness has a direction. A template learned from a document *without* a PO line treats a later document *with* one as a near miss (an unknown label), and learns a version that knows it. A template learned *with* the PO line matches a document without it (a missing optional field).
 
 A field missing in one format but present in another is **not** a problem: each format's template only has rules for the fields that format prints, and a document whose format never prints a field stores it as `not_covered`. An optional field missing from one document of a format (one invoice without a due date) is stored as `absent` and does not affect matching.
 
 *3. Learning a template (new format or near miss).* The LLM supplies **values**; code induces the **rules**. A 7B model is far more reliable at reading values than at writing parsers.
 1. LLM extraction, as in "LLM extraction" below: JSON with each field's raw value and page.
-2. Verbatim gate: each raw value must appear in the claimed page's text. Failing fields are dropped and the document goes to `needs_review`.
-3. Induction, in plain Python: locate each value's words in `words_json`; its anchor is the nearest label on the same line to the left, or else directly above. Record the field, the anchor label, the relation (`right_of` | `below`), the value type (`date` | `amount` | `id` | `text`), page, and expected position. A value with no nearby label gets no rule and stays `not_covered` for this template.
-4. Self-check: apply the induced template to the same document. It must reproduce every LLM value exactly (after normalisation). If not, nothing is saved and the document goes to `needs_review`; its LLM values are still stored if they passed the verbatim gate.
-5. Save `data/templates/<template_id>.v<n>.yaml` (human-readable; header says it was generated and from which document) and a `templates` row with status `probation`.
+2. Verbatim gate: each raw value must appear in the claimed page's text (whitespace differences tolerated). If it is not on the claimed page but is on exactly one other page, it is kept with that page; otherwise it is dropped and the document goes to `needs_review`. A dropped value is never stored.
+3. Induction, in plain Python: locate each value's words in `words_json`; its anchor is the nearest label on the same line to the left, or else directly above. Record the field, the anchor label, the relation (`right_of` | `below`), the value type (`date` | `amount` | `id` | `text`), page, and expected position. A value with no nearby label gets no rule and stays `not_covered` for this template, with one exception: the issuer's name, often printed unlabelled at the top, gets an `at_position` rule (the label-free line nearest that spot). Dates: a layout prints all its dates one way, so if any date the LLM read is unambiguous numeric (`19.03.2026`), its day/month order is stored on every date rule, and settles otherwise ambiguous dates like `02.04.2026`. Parsers never guess an order on their own.
+4. Self-check: apply the induced template to the same document. It must reproduce every LLM value exactly (after normalisation). If not, or if too few core fields are labelled to fingerprint the layout, no template is saved and a note says why. The document keeps its LLM values (they passed the verbatim gate), and its status comes from validation as usual: failing to learn a template is not a data problem.
+5. Save `data/templates/<template_id>.v<n>.yaml` (human-readable; header says it was generated and from which document) and a `templates` row with status `probation` (`trusted` at once if `probation_docs` is 0). For a near miss, if the induced rules and labels are identical to the parent's, no new version is saved.
 
 *4. Probation and trust.* The next `probation_docs` (3) documents that match a probation template are extracted twice, by the template and by the LLM, and compared field by field. Agreement increments `docs_agreed`; at 3 the template becomes `trusted` and later documents use Python only. A disagreement sends that document to `needs_review` and increments `docs_disagreed`; at 2 the template is `retired` and the next document of that layout is learned afresh. If a template's YAML is edited by hand (its `yaml_sha256` changes), it goes back to probation.
 
-*5. Drift on a trusted template.* If a matched template leaves a required field empty or the record fails validation (e.g. subtotal + tax ≠ total), that document falls back to the LLM and goes through step 3 as a near miss, proposing a new version. The old version is never overwritten; documents that still match it keep using it.
+*5. Drift.* If a matched template cannot read a core field (label found but no value, or a value that does not parse), that document falls back to the LLM and goes through step 3 as a near miss, proposing a new version. Values that read fine but do not reconcile (subtotal + tax ≠ total) are *not* drift: what is printed would not change by relearning, so the record is flagged for review instead. The old version is never overwritten; documents that still match it keep using it.
 
-*6. Provenance.* Every field the template has a rule for writes a `field_evidence` row: `presence='found'` with its value, or `presence='absent'` if the label is not on the page. Every schema field the template has no rule for writes `presence='not_covered'`. `extraction_method` records `template:<id>.v<n>` or `llm`. Learned templates are derived from confidential documents, so they live under `data/` (gitignored), not `config/`.
+*6. Provenance.* Every field the template has a rule for writes a `field_evidence` row: `presence='found'` with its value, or `presence='absent'` if the label is not on the page. Every schema field the template has no rule for writes `presence='not_covered'`. For documents read by the LLM, a field the LLM reported as not printed is stored as `not_covered`, not `absent`: an LLM can miss a value, so its silence is not evidence of absence, and §8.6's full-text check applies. If no currency is printed as a field but the amounts carry one consistent currency (`EUR 1.225,46`), that currency is recorded with the total as its source. `extraction_method` records `template:<id>.v<n>` or `llm`. Learned templates are derived from confidential documents, so they live under `data/` (gitignored), not `config/`.
 
 **Value parsers** (shared by all templates; applied to the text a template's anchor points at): record number (labelled patterns like `Invoice\s*(No|#|Number)[:.]?\s*(\S+)`), dates (several formats → ISO; unparseable → raw only + `warning`), amounts (labelled `Grand Total|Total|Amount Due` lines; strip `₹ Rs. INR , ` → Decimal → minor units), tax id (captured via each template's labelled pattern; an optional per-template `tax_id_format` regex acts as a *format check only* — never repair characters, and never hardcode one jurisdiction's format such as GSTIN into code), currency (symbol/code detection; none found → NULL — never default to any currency).
 
@@ -455,7 +460,8 @@ Final output = structured object (the handoff §12.4 contract, adopted as-is: `s
 docintel ingest [--force]        # run/refresh the pipeline; prints per-stage counts
 docintel status                  # coverage report (get_coverage, human-formatted)
 docintel ask "question"          # one-shot Q&A; --json for the raw contract
-docintel show <document_id>      # record + field_evidence for one doc (debug/provenance)
+docintel show <document_id|file> # record + field_evidence for one doc (debug/provenance)  [M2]
+docintel templates               # learned layout templates and their status                  [M2]
 docintel eval                    # run eval/questions.jsonl, write eval/results/<ts>.json
 ```
 

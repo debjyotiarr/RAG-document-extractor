@@ -224,8 +224,10 @@ def test_schema_migrates_v1_database_to_add_word_positions(tmp_path):
 
 
 def run(config, **kwargs):
+    """Text stage only: field extraction has its own tests (test_field_extract.py)."""
     kwargs.setdefault("ocr_check", ocr_ok)
     kwargs.setdefault("ocr_run", fake_ocr)
+    kwargs.setdefault("extract_fields", False)
     return ingest(config, **kwargs)
 
 
@@ -470,7 +472,7 @@ def test_coverage_is_complete_only_when_everything_is_readable(config, vault):
 
 @requires_tesseract
 def test_ingest_with_real_ocr(config):
-    ingest(config)  # real Tesseract
+    ingest(config, extract_fields=False)  # real Tesseract
     (page,) = pages_of(config, "invoice_northwind_inv-0046_scan.pdf")
     assert page["extraction_method"] == "ocr" and "INV-0046" in page["page_text"]
     assert "invoice_northwind_inv-0046_scan.pdf" in fts_files(config, '"Net 30"')
