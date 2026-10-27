@@ -1,0 +1,27 @@
+# docintel configuration (BLUEPRINT §6).
+# Relative paths resolve against the project root (the folder holding config/).
+
+# Folder of PDFs to ingest. Override per run with:  docintel ingest --vault /path/to/pdfs
+vault_dir: data/vault
+db_path: data/app.db
+
+ocr:
+  enabled: true
+  min_chars_per_page: 32        # below this many alphanumeric chars, OCR the page
+  language: eng
+
+llm:
+  provider: ollama              # ollama | anthropic
+  ollama:
+    model: qwen2.5:7b-instruct
+    base_url: http://localhost:11434
+  anthropic:
+    model: claude-haiku-5-5     # optional driver, only used when provider: anthropic
+
+agent:
+  max_tool_calls: 6
+  max_retries_per_tool: 1
+
+extraction:
+  templates_dir: config/templates
+  use_llm_fallback: true        # templates first; LLM only for unmatched formats or empty required fields

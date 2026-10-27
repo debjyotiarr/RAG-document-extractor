@@ -1,9 +1,14 @@
-# Data and derived artifacts — never commit real documents or databases
-data/
+# Data and derived artifacts — never commit real documents or databases.
+# The folders themselves are kept via .gitkeep so the layout exists after cloning.
+data/*
+!data/vault/
+data/vault/*
+!data/vault/.gitkeep
 *.db
 *.db-wal
 *.db-shm
-eval/results/
+eval/results/*
+!eval/results/.gitkeep
 
 # OS junk
 .DS_Store
@@ -11,4 +16,6 @@ eval/results/
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
+.pytest_cache/
