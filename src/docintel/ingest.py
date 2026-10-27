@@ -65,6 +65,7 @@ class Coverage:
     missing_from_disk: list[str]  # in the database but no longer on disk
     fields_pending: list[tuple[str, str]] = field(default_factory=list)  # text read, fields not extracted yet
     needs_review: list[tuple[str, str]] = field(default_factory=list)
+    unknown_type: list[str] = field(default_factory=list)  # read, but neither invoice nor order nor other
 
     @property
     def is_complete(self) -> bool:
@@ -208,17 +209,23 @@ def _extract_all(conn, config: Config, llm: LLMClient, report: IngestReport, on_
             on_fields(row["relative_path"], outcome)
 
 
-def coverage(config: Config) -> Coverage:
-    """What has and has not been read, comparing the database against the vault on disk."""
+def coverage(config: Config, conn: sqlite3.Connection | None = None) -> Coverage:
+    """What has and has not been read, comparing the database against the vault on disk.
+
+    Pass `conn` to use an existing (e.g. read-only) connection; otherwise one is opened.
+    """
     files = discover(config.vault_dir)
     on_disk = {file_sha256(p): p.relative_to(config.vault_dir).as_posix() for p in files}
-    conn = db.connect(config.db_path)
+    own = conn is None
+    conn = conn or db.connect(config.db_path)
     try:
         rows = conn.execute(
-            "SELECT file_hash, relative_path, processing_status, error_message FROM documents ORDER BY relative_path"
+            "SELECT file_hash, relative_path, processing_status, error_message, document_type FROM documents"
+            " ORDER BY relative_path"
         ).fetchall()
     finally:
-        conn.close()
+        if own:
+            conn.close()
     in_db = {r["file_hash"] for r in rows}
     present = [r for r in rows if r["file_hash"] in on_disk]
     by_status: dict[str, int] = {}
@@ -241,6 +248,7 @@ def coverage(config: Config) -> Coverage:
         needs_review=[
             (r["relative_path"], r["error_message"]) for r in present if r["processing_status"] == "needs_review"
         ],
+        unknown_type=[r["relative_path"] for r in present if r["document_type"] == "unknown"],
     )
 
 

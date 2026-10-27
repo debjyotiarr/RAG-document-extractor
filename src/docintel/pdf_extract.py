@@ -95,7 +95,9 @@ def _open(path: Path | str) -> pymupdf.Document:
     try:
         doc = pymupdf.open(path, filetype="pdf")
     except Exception as exc:
-        raise PdfOpenError(f"cannot open as PDF: {exc}") from exc
+        # Keep local folder paths out of messages: they end up in reports and answers.
+        message = str(exc).replace(str(path), Path(path).name)
+        raise PdfOpenError(f"cannot open as PDF: {message}") from exc
     if doc.needs_pass:
         doc.close()
         raise PdfOpenError("PDF is password-protected")

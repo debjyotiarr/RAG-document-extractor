@@ -1,17 +1,19 @@
 """Command-line entry point: ingest, status, ask, show, eval (BLUEPRINT §8.7).
 
-Implemented so far: `ingest`, `status`, `show` and `templates` (milestones M1-M2).
+Implemented so far: `ingest`, `status`, `show`, `templates` (M1-M2) and `tool` (M3).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 
 from docintel import db
 from docintel import ingest as ingest_mod
 from docintel.config import ConfigError, load_config
+from docintel.tools import ToolBox, tool_specs
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,6 +49,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("templates", parents=[common], help="list the layout templates learned so far")
     p.set_defaults(handler=_cmd_templates)
+
+    p = sub.add_parser(
+        "tool",
+        parents=[common],
+        help="call one of the agent's tools directly, e.g. tool search_text '{\"query\": \"net 30\"}'",
+    )
+    p.add_argument("name", nargs="?", help="tool name; omit to list the tools")
+    p.add_argument("arguments", nargs="?", default="{}", help="JSON object of arguments")
+    p.set_defaults(handler=_cmd_tool)
     return parser
 
 
@@ -171,6 +182,29 @@ def _cmd_templates(config, args) -> int:
             f" disagreed {r['docs_disagreed']}, documents {used.get(key, 0)}, learned from {r['learned_from_file']}"
         )
     return 0
+
+
+def _cmd_tool(config, args) -> int:
+    if not args.name:
+        for spec in tool_specs():
+            fn = spec["function"]
+            params = ", ".join(fn["parameters"].get("properties", {}))
+            print(f"{fn['name']}({params})\n    {fn['description']}")
+        return 0
+    try:
+        arguments = json.loads(args.arguments)
+    except json.JSONDecodeError as exc:
+        print(f"error: arguments must be a JSON object: {exc}", file=sys.stderr)
+        return 1
+    try:
+        tools = ToolBox(config)
+    except (FileNotFoundError, db.SchemaVersionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    with tools:
+        result = tools.call(args.name, arguments if isinstance(arguments, dict) else None)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 1 if "error" in result and result.get("error") != "mixed_currencies" else 0
 
 
 if __name__ == "__main__":

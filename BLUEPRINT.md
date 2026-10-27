@@ -395,36 +395,42 @@ A field missing in one format but present in another is **not** a problem: each 
 
 ### 8.5 `tools.py` + `agent.py` — the agentic layer
 
-Five tools, all read-only, all returning JSON-serializable dicts that include provenance:
+Five tools, all read-only, all returning JSON-serializable dicts that include provenance. Built and tested in M3 (`tools.py`, `retrieval.py`); `docintel tool <name> '<json>'` calls any of them by hand.
+
+Shared filters (flat arguments, not a nested object: a 7B model fills flat arguments far more reliably): `record_type`, `counterparty` (case-insensitive substring), `record_number` (exact, ignoring case and spaces), `po_reference`, `currency`, `date_from`, `date_to` (issue date, inclusive), `missing` (records where the listed fields were not found). Field names the agent sees: `record_number, counterparty, counterparty_tax_id, record_date, due_date, po_reference, currency, subtotal, tax, total, payment_terms`.
 
 ```python
-def lookup_documents(record_number=None, counterparty=None, filename=None,
-                     record_type=None, date_from=None, date_to=None) -> dict
-    # exact + indexed lookups over `records`/`documents`.
-    # Returns list of matches with document_id, filename, record_type, key fields.
-    # >1 match for a supposedly-unique identifier is reported as-is (ambiguity
-    # handling happens in the orchestrator, not hidden here).
+lookup_documents(<filters>, filename=None, limit=20)
+    # Matching documents with their key fields. A record_number with no exact match is retried as a
+    # fragment ("0044") and labelled match="partial". >1 match for a record_number -> ambiguous=true
+    # plus a note; the tool never picks one. filename search includes documents without records.
 
-def query_structured(operation, filters, field) -> dict
-    # operation ∈ {sum, count, avg, min, max, list}; field ∈ whitelisted columns.
-    # Compiles to parameterized SQL against `records`. NO raw SQL from the model.
-    # sum/avg over money: refuses mixed currencies in scope — returns
-    # {"error": "mixed_currencies", "currencies": [...]} instead of a number.
-    # Result includes the record_ids aggregated over (for citation).
+query_structured(operation, field=None, <filters>, limit=50)
+    # operation in {count, sum, avg, min, max, list}. sum/avg need an amount field; min/max an amount
+    # or date. Exact integer arithmetic in minor units; avg rounds half-up.
+    # Money across currencies -> {"error": "mixed_currencies", "currencies": [...], "per_currency": {...}}
+    #   with no combined value ("(unknown)" counts as a currency).
+    # Always: the records used (for citation); missing_values = records excluded because the field is
+    # empty; unverified_records = included records flagged for review; possible_duplicates = same
+    # number and counterparty in different files.
 
-def search_text(query, record_type=None, limit=10) -> dict
-    # FTS5 MATCH over pages_fts (query sanitized: strip FTS operators or quote).
-    # Returns [{document_id, filename, page, snippet(±150 chars)}].
-    # v1: lexical only. Phase 2 swaps in HybridRetriever behind same signature.
+search_text(query, record_type=None, document_id=None, limit=10)
+    # FTS5 over page text via the Retriever interface. Terms are extracted and quoted, so no query can
+    # act as FTS syntax. Tries the exact phrase, then all words, then any word, and reports which
+    # (match_mode); "any_term" results carry a "check relevance" note. Hits: file, page, snippet with
+    # the match in [brackets]. Phase 2 swaps in a hybrid retriever behind the same signature.
 
-def get_evidence(document_id, field_name=None, question=None) -> dict
-    # field_name → the field_evidence row(s): raw value, page, supporting text.
-    # question → best page excerpts from that document (FTS scoped to doc).
+get_evidence(document_id, field=None, question=None)
+    # document_id may also be a file name. Per field: presence (found / absent / not_covered) with its
+    # meaning, value, printed_as, page, supporting_text, method, status. question -> excerpts from
+    # that document. Documents without a record say why (e.g. the read error).
 
-def get_coverage() -> dict
-    # {"files_on_disk": N, "processed_ok": N, "needs_review": [...],
-    #  "failed": [...], "ocr_pending": [...], "unknown_type": [...]}
+get_coverage()
+    # complete, files_on_disk, documents, by_status, failed, ocr_required, not_ingested,
+    # deleted_since_ingest, fields_pending, needs_review, unknown_type. Hashes the vault on disk.
 ```
+
+Every result except get_coverage also carries `scope`: documents in the database, `not_searchable` (failed / needs OCR), `fields_pending` (searchable but missing from structured queries) and the review count, from the database alone. Bad tool names, unknown or invalid arguments, and database errors come back as `{"error": ...}`, never as exceptions, so the agent can correct itself. Error messages never contain local folder paths.
 
 **Agent loop** (`agent.py`), ~100 lines, no framework:
 
@@ -462,6 +468,7 @@ docintel status                  # coverage report (get_coverage, human-formatte
 docintel ask "question"          # one-shot Q&A; --json for the raw contract
 docintel show <document_id|file> # record + field_evidence for one doc (debug/provenance)  [M2]
 docintel templates               # learned layout templates and their status                  [M2]
+docintel tool [name] ['<json>']  # list the agent tools, or call one by hand                   [M3]
 docintel eval                    # run eval/questions.jsonl, write eval/results/<ts>.json
 ```
 

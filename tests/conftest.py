@@ -8,6 +8,7 @@ import pytest
 from fixtures.make_fixtures import generate_corpus, generate_extra_layouts
 
 from docintel.config import DEFAULT_CONFIG_PATH, load_config
+from docintel.ingest import ingest
 from docintel.pdf_extract import PageText, ocr_unavailable_reason
 
 # Tests that run real Tesseract OCR are skipped where it is not installed.
@@ -115,3 +116,21 @@ class FakeLLM:
 
         best = max(self.docs, key=hits)
         return best if hits(best) >= 3 else None
+
+
+@pytest.fixture(scope="session")
+def ingested(corpus, tmp_path_factory):
+    """A fully ingested copy of the corpus (fake OCR, FakeLLM), shared read-only by tool tests.
+
+    Returns the Config. Tests must not modify its vault or database.
+    """
+    directory, manifest = corpus
+    root = tmp_path_factory.mktemp("ingested")
+    vault = root / "vault"
+    vault.mkdir()
+    for pdf in directory.glob("*.pdf"):
+        shutil.copy2(pdf, vault / pdf.name)
+    cfg = load_config(DEFAULT_CONFIG_PATH, vault_dir=vault, db_path=root / "app.db")
+    cfg.extraction.templates_dir = root / "templates"
+    ingest(cfg, llm=FakeLLM(manifest), ocr_check=ocr_ok, ocr_run=fake_ocr)
+    return cfg

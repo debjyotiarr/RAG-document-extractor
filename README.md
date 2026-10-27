@@ -4,12 +4,13 @@ Build a system to extract information from PDFs (invoices and purchase orders), 
 
 ## Status
 
-Milestones M0 to M2 are complete:
+Milestones M0 to M3 are complete:
 
 - **Text:** the vault is read into the database page by page, with OCR for scanned pages.
 - **Fields:** each invoice and purchase order is reduced to fields (number, dates, party, amounts, terms), with the page and printed text each value came from.
+- **Tools:** the question-answering agent's five tools exist and can be called by hand: lookups, exact totals and counts, full-text search, provenance and coverage.
 
-Question answering comes next (M3 onwards).
+The agent that chooses between these tools comes next (M4).
 
 Run the tests with `pytest`. To look at the fixture PDFs, run `python tests/fixtures/make_fixtures.py` and open `tests/fixtures/corpus/`.
 
@@ -31,7 +32,18 @@ docintel status                         # what has been read, what failed, what 
 docintel ingest --force                 # re-read everything
 docintel show invoice_0042.pdf          # one document's fields, where each came from, and how
 docintel templates                      # the layouts learned so far
+docintel tool                           # list the agent's tools
+docintel tool lookup_documents '{"record_number": "INV-0044"}'
+docintel tool query_structured '{"operation": "sum", "field": "total", "record_type": "invoice", "currency": "EUR"}'
+docintel tool search_text '{"query": "warranty"}'
 ```
+
+The tools are what the agent will use to answer questions. Calling them by hand shows exactly what it will see:
+
+- **Ambiguous numbers:** a number shared by two documents comes back flagged `ambiguous`, never silently picked.
+- **Currencies:** a total across currencies is refused, and per-currency totals are returned instead.
+- **Excluded records:** records with missing values are listed, not quietly left out.
+- **Coverage:** every result says which files could not be searched.
 
 How `ingest` treats the vault:
 
